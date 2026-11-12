@@ -215,6 +215,13 @@
       <option value="vibrate">Vibrate only</option>
       <option value="silent">Silent</option>
     </select>
+    <label for="setStrength">Tone strength</label>
+    <select id="setStrength">
+      <option value="subtle">Subtle (quiet, played once)</option>
+      <option value="normal">Normal</option>
+      <option value="strong">Strong (louder, played twice)</option>
+    </select>
+    <label style="display:flex;align-items:center;gap:10px;color:var(--text);font-size:15px"><input type="checkbox" id="setBuzzToo" style="width:22px;height:22px"> Also vibrate with each tone</label>
     <label for="setVol">Volume</label><input type="range" id="setVol" min="0" max="100">
     <div class="row">
       <div><label for="setGrace">Seconds out of zone before a cue</label><input type="number" id="setGrace" min="3" max="120" inputmode="numeric"></div>
@@ -224,6 +231,7 @@
     <div class="row"><button class="btn sec small" data-cue="above">Above zone</button><button class="btn sec small" data-cue="below">Below zone</button></div>
     <div class="row mt"><button class="btn sec small" data-cue="in">Back in zone</button><button class="btn sec small" data-cue="hard">Hard part starts</button></div>
     <div class="row mt"><button class="btn sec small" data-cue="easy">Easy part starts</button><button class="btn sec small" data-cue="done">Session done</button></div>
+    <p class="note">Falling and slow means ease off. Climbing and quick means push. One chord means you're back on target.</p>
   </div>
   <div class="card">
     <h2>You</h2>
@@ -459,7 +467,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
   var LB = 0.45359237;
 
   /* ---------- storage ---------- */
-  var DEFAULTS = { mode: 'tones', vol: 60, grace: 10, repeat: 30, age: 48, weightLb: 157, maxHr: 172, rounds: 4, tgtLo: 90, tgtHi: 120, restHr: 62, demo: false };
+  var DEFAULTS = { mode: 'tones', vol: 60, grace: 10, repeat: 30, age: 48, weightLb: 157, maxHr: 172, rounds: 4, tgtLo: 90, tgtHi: 120, restHr: 62, strength: 'normal', buzzToo: false, demo: false };
   var db = { settings: {}, sessions: [], body: [] };
   function load() {
     try { var raw = localStorage.getItem(KEY); if (raw) { var d = JSON.parse(raw); db.sessions = d.sessions || []; db.body = d.body || []; db.settings = d.settings || {}; } } catch (e) {}
@@ -476,29 +484,47 @@ if (typeof module !== 'undefined') module.exports = HRCore;
     if (actx && actx.state === 'suspended') { try { actx.resume(); } catch (e) {} }
     return actx;
   }
+  /* Each cue has its own shape so it can be told apart without thinking:
+     ease-off cues fall slowly, push cues climb quickly, "in zone" is a single chord.
+     Notes: [frequency, start, length, loudness]. */
+  var N = { G4: 392.00, C5: 523.25, D5: 587.33, E5: 659.25, F5: 698.46, G5: 783.99, A5: 880.00, C6: 1046.50, E6: 1318.51 };
   var TONES = {
-    above: [[659, 0, .22], [880, .16, .3]],
-    below: [[659, 0, .22], [494, .16, .3]],
-    'in': [[1047, 0, .5]],
-    hard: [[523, 0, .14], [659, .11, .14], [784, .22, .14], [1047, .33, .32]],
-    easy: [[784, 0, .26], [659, .22, .26], [523, .44, .42]],
-    segment: [[784, 0, .2], [784, .26, .28]],
-    done: [[523, 0, .16], [659, .14, .16], [784, .28, .16], [659, .42, .16], [1047, .56, .5]],
-    tick: [[880, 0, .08]]
+    above: [[N.A5, 0, .55, 1], [N.F5, .34, .55, 1], [N.D5, .68, .9, 1]],
+    below: [[N.C5, 0, .16, 1], [N.E5, .12, .16, 1], [N.G5, .24, .16, 1], [N.C6, .36, .3, 1], [N.G5, .6, .16, 1], [N.C6, .72, .5, 1]],
+    'in': [[N.C5, 0, 1.3, .7], [N.E5, .02, 1.3, .7], [N.G5, .04, 1.3, .7]],
+    hard: [[N.G4, 0, .14, 1], [N.G4, .17, .14, 1], [N.G4, .34, .14, 1], [N.C5, .51, .3, 1], [N.E5, .78, .3, 1], [N.G5, 1.05, .8, 1]],
+    easy: [[N.E5, 0, .9, .9], [N.C5, .6, .9, .9], [N.G4, 1.2, 1.3, .9]],
+    segment: [[N.D5, 0, .5, 1], [N.A5, .3, .8, 1]],
+    done: [[N.C5, 0, .3, 1], [N.E5, .2, .3, 1], [N.G5, .4, .3, 1], [N.C6, .6, .5, 1], [N.G5, .95, .3, 1], [N.C5, 1.2, 1.4, .7], [N.E5, 1.2, 1.4, .7], [N.G5, 1.2, 1.4, .7], [N.C6, 1.2, 1.4, .7]],
+    tick: [[N.E6, 0, .09, .6]]
   };
   var VOICE = { above: 'Ease off', below: 'Pick it up', 'in': 'In zone', hard: 'Hard effort. Go.', easy: 'Easy now', segment: 'Next part', done: 'Session complete' };
   var BUZZ = { above: [180, 90, 180], below: [450], 'in': [70], hard: [90, 60, 90, 60, 90], easy: [300, 100, 300], segment: [120, 80, 120], done: [100, 60, 100, 60, 400], tick: [30] };
+  var master = null;
+  function out(ctx) {
+    if (!master) { try { master = ctx.createDynamicsCompressor(); master.connect(ctx.destination); } catch (e) { master = ctx.destination; } }
+    return master;
+  }
   function playTones(name) {
     var ctx = audio(); if (!ctx) return;
-    var vol = Math.max(0, Math.min(1, S().vol / 100)) * (name === 'in' || name === 'tick' ? 0.25 : 0.4);
-    (TONES[name] || []).forEach(function (n) {
-      var o = ctx.createOscillator(), g = ctx.createGain(), t0 = ctx.currentTime + n[1];
-      o.type = 'sine'; o.frequency.value = n[0];
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(Math.max(vol, 0.0002), t0 + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + n[2]);
-      o.connect(g); g.connect(ctx.destination); o.start(t0); o.stop(t0 + n[2] + 0.05);
+    var strength = S().strength || 'normal';
+    var level = Math.max(0, Math.min(1, S().vol / 100)) * (strength === 'subtle' ? 0.22 : strength === 'strong' ? 0.9 : 0.5);
+    var notes = TONES[name] || [], reps = strength === 'strong' && name !== 'tick' && name !== 'done' ? 2 : 1;
+    var span = notes.reduce(function (m, n) { return Math.max(m, n[1] + n[2]); }, 0);
+    var dest = out(ctx);
+    for (var r = 0; r < reps; r++) notes.forEach(function (n) {
+      var t0 = ctx.currentTime + 0.03 + n[1] + r * (span * 0.75 + 0.25), peak = Math.max(level * n[3], 0.0002);
+      /* bell-like voice: a triangle wave plus two quieter overtones */
+      [[1, 'triangle', 1], [2, 'sine', .35], [3, 'sine', .12]].forEach(function (h) {
+        var o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = h[1]; o.frequency.value = n[0] * h[0];
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(peak * h[2], t0 + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + n[2]);
+        o.connect(g); g.connect(dest); o.start(t0); o.stop(t0 + n[2] + 0.05);
+      });
     });
+    if (S().buzzToo && name !== 'tick') { try { if (navigator.vibrate) navigator.vibrate(BUZZ[name] || [100]); } catch (e) {} }
   }
   function cue(name) {
     var mode = S().mode;
@@ -812,7 +838,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
   function fillTypes(sel) { sel.innerHTML = C.TYPES.map(function (t) { return '<option value="' + t.id + '">' + esc(t.name) + '</option>'; }).join(''); }
   function renderSettings() {
     var s = S();
-    $('setMode').value = s.mode; $('setVol').value = s.vol; $('setGrace').value = s.grace; $('setRepeat').value = s.repeat;
+    $('setMode').value = s.mode; $('setStrength').value = s.strength; $('setBuzzToo').checked = !!s.buzzToo; $('setVol').value = s.vol; $('setGrace').value = s.grace; $('setRepeat').value = s.repeat;
     $('setAge').value = s.age; $('setWeight').value = s.weightLb; $('setMax').value = s.maxHr; $('setRest').value = s.restHr; $('setRounds').value = s.rounds;
     $('setTgtLo').value = s.tgtLo; $('setTgtHi').value = s.tgtHi; $('setDemo').checked = !!s.demo;
     var b = C.zoneBounds(s.maxHr);
@@ -821,7 +847,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
   function num(id, lo, hi, dflt) { var v = parseFloat($(id).value); if (isNaN(v)) return dflt; return Math.max(lo, Math.min(hi, v)); }
   function readSettings() {
     var s = S();
-    s.mode = $('setMode').value; s.vol = +$('setVol').value; s.grace = Math.round(num('setGrace', 3, 120, s.grace)); s.repeat = Math.round(num('setRepeat', 10, 600, s.repeat));
+    s.mode = $('setMode').value; s.strength = $('setStrength').value; s.buzzToo = $('setBuzzToo').checked; s.vol = +$('setVol').value; s.grace = Math.round(num('setGrace', 3, 120, s.grace)); s.repeat = Math.round(num('setRepeat', 10, 600, s.repeat));
     s.age = Math.round(num('setAge', 10, 100, s.age)); s.weightLb = num('setWeight', 60, 500, s.weightLb); s.maxHr = Math.round(num('setMax', 120, 230, s.maxHr)); s.restHr = Math.round(num('setRest', 30, 110, s.restHr));
     s.rounds = Math.round(num('setRounds', 1, 8, s.rounds)); s.tgtLo = Math.round(num('setTgtLo', 0, 900, s.tgtLo)); s.tgtHi = Math.max(s.tgtLo, Math.round(num('setTgtHi', 0, 900, s.tgtHi)));
     s.demo = $('setDemo').checked; persist(); renderSettings(); planDesc();
@@ -922,8 +948,8 @@ if (typeof module !== 'undefined') module.exports = HRCore;
     if (delb) { if (armDelete === delb) { db.body = db.body.filter(function (b) { return b.id !== delb; }); armDelete = null; persist(); } else armDelete = delb; renderLog(); return; }
     if (o) { var id = o.getAttribute('data-open'); openId = openId === id ? null : id; armDelete = null; renderLog(); }
   });
-  ['setMode', 'setVol', 'setGrace', 'setRepeat', 'setAge', 'setWeight', 'setMax', 'setRest', 'setRounds', 'setTgtLo', 'setTgtHi', 'setDemo'].forEach(function (id) { $(id).addEventListener('change', readSettings); });
-  document.querySelectorAll('[data-cue]').forEach(function (b) { b.addEventListener('click', function () { S().mode = $('setMode').value; S().vol = +$('setVol').value; audio(); cue(b.getAttribute('data-cue')); }); });
+  ['setMode', 'setStrength', 'setBuzzToo', 'setVol', 'setGrace', 'setRepeat', 'setAge', 'setWeight', 'setMax', 'setRest', 'setRounds', 'setTgtLo', 'setTgtHi', 'setDemo'].forEach(function (id) { $(id).addEventListener('change', readSettings); });
+  document.querySelectorAll('[data-cue]').forEach(function (b) { b.addEventListener('click', function () { S().mode = $('setMode').value; S().strength = $('setStrength').value; S().buzzToo = $('setBuzzToo').checked; S().vol = +$('setVol').value; audio(); cue(b.getAttribute('data-cue')); }); });
   $('btnCsv').addEventListener('click', function () { download('hr-coach-' + todayStr() + '.csv', csv(), 'text/csv'); });
   $('btnJson').addEventListener('click', function () { download('hr-coach-backup-' + todayStr() + '.json', JSON.stringify(db), 'application/json'); });
   $('btnCopy').addEventListener('click', function () {
