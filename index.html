@@ -210,7 +210,7 @@
     <h2>Cues</h2>
     <label for="setMode">Cue style</label>
     <select id="setMode">
-      <option value="tones">Tones (subtle, no words)</option>
+      <option value="tones">Tones and your own sounds (no words)</option>
       <option value="voice">Voice</option>
       <option value="vibrate">Vibrate only</option>
       <option value="silent">Silent</option>
@@ -232,6 +232,13 @@
     <div class="row mt"><button class="btn sec small" data-cue="in">Back in zone</button><button class="btn sec small" data-cue="hard">Hard part starts</button></div>
     <div class="row mt"><button class="btn sec small" data-cue="easy">Easy part starts</button><button class="btn sec small" data-cue="done">Session done</button></div>
     <p class="note">Falling and slow means ease off. Climbing and quick means push. One chord means you're back on target.</p>
+  </div>
+  <div class="card">
+    <h2>Your own cue sounds</h2>
+    <p class="note" style="margin-top:0">Pick an audio file from your phone for any cue. These play when the cue style is Tones. Cues without a file use the built-in tone.</p>
+    <div id="soundRows"></div>
+    <input type="file" id="soundFile" accept="audio/*,.mp3,.wav,.ogg,.m4a" class="hide">
+    <div class="status" id="soundStatus"></div>
   </div>
   <div class="card">
     <h2>You</h2>
@@ -256,7 +263,7 @@
   </div>
   <div class="card">
     <h2>Data</h2>
-    <p class="note" style="margin-top:0">Everything is stored in this browser on this phone. Back it up now and then.</p>
+    <p class="note" style="margin-top:0">Everything is stored in this browser on this phone. Back it up now and then. The backup covers sessions and settings, not your sound files.</p>
     <button class="btn sec small mt" id="btnCopy">Copy last 14 days for Claude</button>
     <div class="row mt"><button class="btn sec small" id="btnCsv">Download CSV</button><button class="btn sec small" id="btnJson">Download backup</button></div>
     <label for="fileImport">Restore from a backup file</label><input type="file" id="fileImport" accept="application/json,.json">
@@ -526,6 +533,87 @@ if (typeof module !== 'undefined') module.exports = HRCore;
     });
     if (S().buzzToo && name !== 'tick') { try { if (navigator.vibrate) navigator.vibrate(BUZZ[name] || [100]); } catch (e) {} }
   }
+  /* ---------- your own sound files (kept in this browser's IndexedDB) ---------- */
+  var CUES = [['above', 'Above zone (ease off)'], ['below', 'Below zone (pick it up)'], ['in', 'Back in zone'], ['hard', 'Hard part starts'], ['easy', 'Easy part starts'], ['segment', 'Next part (other plans)'], ['done', 'Session done']];
+  var custom = {}, pendingCue = null, MAX_CLIP = 8;
+  function idb() {
+    return new Promise(function (res, rej) {
+      try {
+        var rq = indexedDB.open('hrcoach', 1);
+        rq.onupgradeneeded = function () { rq.result.createObjectStore('sounds'); };
+        rq.onsuccess = function () { res(rq.result); }; rq.onerror = function () { rej(rq.error); };
+      } catch (e) { rej(e); }
+    });
+  }
+  function idbDo(mode, fn) {
+    return idb().then(function (d) {
+      return new Promise(function (res, rej) {
+        var tx = d.transaction('sounds', mode), out = fn(tx.objectStore('sounds'));
+        tx.oncomplete = function () { res(out && out.result); }; tx.onerror = function () { rej(tx.error); };
+      });
+    });
+  }
+  function loadSounds() {
+    return idb().then(function (d) {
+      return new Promise(function (res) {
+        var tx = d.transaction('sounds', 'readonly'), cur = tx.objectStore('sounds').openCursor();
+        cur.onsuccess = function () { var c = cur.result; if (c) { custom[c.key] = { name: c.value.name, raw: c.value.data, buf: null }; c.continue(); } };
+        tx.oncomplete = res; tx.onerror = res;
+      });
+    }).catch(function () {}).then(renderSoundRows);
+  }
+  function decodeSound(name) {
+    var c = custom[name], ctx = audio();
+    if (!c || !ctx) return Promise.reject(new Error('none'));
+    if (c.buf) return Promise.resolve(c.buf);
+    return new Promise(function (res, rej) { ctx.decodeAudioData(c.raw.slice(0), function (b) { c.buf = b; res(b); }, rej); });
+  }
+  function decodeAll() { Object.keys(custom).forEach(function (k) { decodeSound(k).catch(function () {}); }); }
+  function playBuffer(buf, name) {
+    var ctx = audio(); if (!ctx) return;
+    var strength = S().strength || 'normal';
+    var level = Math.max(0, Math.min(1, S().vol / 100)) * (strength === 'subtle' ? 0.4 : strength === 'strong' ? 1.4 : 0.9);
+    var len = Math.min(buf.duration, MAX_CLIP), reps = strength === 'strong' && len < 2 && name !== 'done' ? 2 : 1;
+    for (var r = 0; r < reps; r++) {
+      var src = ctx.createBufferSource(), g = ctx.createGain(), t0 = ctx.currentTime + 0.03 + r * (len + 0.25);
+      src.buffer = buf; g.gain.setValueAtTime(level, t0);
+      if (buf.duration > MAX_CLIP) g.gain.setValueAtTime(level, t0 + MAX_CLIP - 0.4), g.gain.linearRampToValueAtTime(0.0001, t0 + MAX_CLIP);
+      src.connect(g); g.connect(out(ctx)); src.start(t0); src.stop(t0 + len + 0.05);
+    }
+    if (S().buzzToo) { try { if (navigator.vibrate) navigator.vibrate(BUZZ[name] || [100]); } catch (e) {} }
+  }
+  function playCue(name) {
+    var c = custom[name];
+    if (!c) { playTones(name); return; }
+    if (c.buf) { playBuffer(c.buf, name); return; }
+    decodeSound(name).then(function (b) { playBuffer(b, name); }).catch(function () { playTones(name); });
+  }
+  function renderSoundRows() {
+    var el = $('soundRows'); if (!el) return;
+    el.innerHTML = CUES.map(function (c) {
+      var has = custom[c[0]];
+      return '<div class="sess"><div class="t" style="font-size:15px">' + esc(c[1]) + '</div><div class="d">' + (has ? esc(has.name) : 'Built-in tone') + '</div>' +
+        '<div class="row mt"><button class="btn sec small" data-splay="' + c[0] + '">Play</button><button class="btn sec small" data-spick="' + c[0] + '">Choose file</button>' +
+        (has ? '<button class="btn sec small" data-sclear="' + c[0] + '">Built-in</button>' : '') + '</div></div>';
+    }).join('');
+  }
+  function soundStatus(t) { $('soundStatus').textContent = t; }
+  function addSound(cueName, file) {
+    if (file.size > 5 * 1024 * 1024) { soundStatus('That file is over 5 MB. Pick a shorter clip.'); return; }
+    var rd = new FileReader();
+    rd.onerror = function () { soundStatus('Could not read that file.'); };
+    rd.onload = function () {
+      var raw = rd.result;
+      custom[cueName] = { name: file.name, raw: raw, buf: null };
+      decodeSound(cueName).then(function (b) {
+        return idbDo('readwrite', function (st) { return st.put({ name: file.name, data: raw }, cueName); }).then(function () {
+          soundStatus('Saved ' + file.name + (b.duration > MAX_CLIP ? '. It is long, so only the first ' + MAX_CLIP + ' seconds will play.' : '.'));
+        }, function () { soundStatus('The sound works now, but this browser would not store it, so it will be gone after a reload.'); });
+      }).catch(function () { delete custom[cueName]; soundStatus('Chrome could not play that file. Try an MP3 or WAV.'); }).then(function () { renderSoundRows(); if (custom[cueName]) playCue(cueName); });
+    };
+    rd.readAsArrayBuffer(file);
+  }
+
   function cue(name) {
     var mode = S().mode;
     if (mode === 'silent') return;
@@ -539,7 +627,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
         }
       } catch (e) {}
     }
-    playTones(name);
+    playCue(name);
   }
 
   /* ---------- strap ---------- */
@@ -608,7 +696,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
   function cfg() { return { maxHr: S().maxHr, grace: S().grace, repeat: S().repeat, kg: S().weightLb * LB, age: S().age, restHr: S().restHr }; }
 
   function startSession() {
-    audio();
+    audio(); decodeAll();
     var plan = C.buildPlan($('selPlan').value, S().rounds);
     run.demo = !!S().demo;
     if (!run.demo && !strap.connected) { strapStatus('Connect the strap first, or turn on Demo mode in Settings.'); return; }
@@ -950,6 +1038,14 @@ if (typeof module !== 'undefined') module.exports = HRCore;
   });
   ['setMode', 'setStrength', 'setBuzzToo', 'setVol', 'setGrace', 'setRepeat', 'setAge', 'setWeight', 'setMax', 'setRest', 'setRounds', 'setTgtLo', 'setTgtHi', 'setDemo'].forEach(function (id) { $(id).addEventListener('change', readSettings); });
   document.querySelectorAll('[data-cue]').forEach(function (b) { b.addEventListener('click', function () { S().mode = $('setMode').value; S().strength = $('setStrength').value; S().buzzToo = $('setBuzzToo').checked; S().vol = +$('setVol').value; audio(); cue(b.getAttribute('data-cue')); }); });
+  $('soundRows').addEventListener('click', function (e) {
+    var t = e.target, a = function (k) { return t.getAttribute && t.getAttribute(k); };
+    if (a('data-splay')) { audio(); playCue(a('data-splay')); }
+    else if (a('data-spick')) { pendingCue = a('data-spick'); $('soundFile').value = ''; $('soundFile').click(); }
+    else if (a('data-sclear')) { var k = a('data-sclear'); delete custom[k]; idbDo('readwrite', function (st) { return st.delete(k); }).catch(function () {}); renderSoundRows(); soundStatus('Back to the built-in tone.'); }
+  });
+  $('soundFile').addEventListener('change', function () { var f = $('soundFile').files[0]; if (f && pendingCue) addSound(pendingCue, f); });
+  renderSoundRows(); loadSounds();
   $('btnCsv').addEventListener('click', function () { download('hr-coach-' + todayStr() + '.csv', csv(), 'text/csv'); });
   $('btnJson').addEventListener('click', function () { download('hr-coach-backup-' + todayStr() + '.json', JSON.stringify(db), 'application/json'); });
   $('btnCopy').addEventListener('click', function () {
@@ -972,7 +1068,7 @@ if (typeof module !== 'undefined') module.exports = HRCore;
     rd.readAsText(f);
   });
   renderAll();
-  window.__app = { db: db, run: run, strap: strap, tick: tick, startSession: startSession, stopSession: stopSession, renderAll: renderAll, switchTab: switchTab, csv: csv, claudeText: claudeText };
+  window.__app = { custom: custom, db: db, run: run, strap: strap, tick: tick, startSession: startSession, stopSession: stopSession, renderAll: renderAll, switchTab: switchTab, csv: csv, claudeText: claudeText };
 })();
 </script>
 </body>
